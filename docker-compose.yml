@@ -11,6 +11,9 @@ services:
       LAKE_GC_INTERVAL_SEC: "2"
       # demo/test hook: artificial merge delay; keep 0 in production
       LAKE_COMPACTION_DELAY_SEC: "0"
+      # batch withdrawal feature (1/on/true enabled, 0/off/false disabled).
+      # Only uploads made while enabled become withdrawable batches.
+      LAKE_WITHDRAWALS_ENABLED: "1"
     volumes:
       - lake-data:/data
     restart: unless-stopped

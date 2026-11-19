@@ -16,6 +16,13 @@ Consistency model (single process, SQLite as the source of truth):
   job still ``running`` at startup is guaranteed not to have switched; it
   is simply re-executed.  Orphaned bytes (failed uploads, superseded
   compaction outputs, tmp fragments) are swept before serving traffic.
+* Withdrawal: uploads made while the feature is enabled become tracked
+  batches whose row multiset is persisted alongside parquet provenance.
+  Withdrawing a batch rewrites (multiset difference) the file currently
+  carrying its rows -- the original name stays a valid handle even after
+  compaction and garbage collection.  The registry switch and the batch's
+  ``withdrawn`` state commit in one transaction, so a failed write keeps
+  every original row and the batch stays withdrawable.
 """
 
 from __future__ import annotations
@@ -33,6 +40,12 @@ from uuid import uuid4
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from .batch import (
+    multiset_difference,
+    read_parquet_rows,
+    rows_to_table,
+    table_to_rows,
+)
 from .csvio import CsvError, empty_table, parse_csv
 from .db import connect, init_schema
 from .storage import write_parquet_atomic
@@ -42,6 +55,18 @@ log = logging.getLogger("buoy-lake")
 
 class ConflictError(RuntimeError):
     """A compaction is already running for this day."""
+
+
+class WithdrawalConflictError(RuntimeError):
+    """The target file changed while the withdrawal was being applied."""
+
+
+class WithdrawalNotAllowedError(RuntimeError):
+    """The file cannot be withdrawn (unknown name / feature disabled)."""
+
+
+class WithdrawalWriteError(RuntimeError):
+    """Writing the withdrawal rewrite failed; original data is untouched."""
 
 
 class NotFoundError(KeyError):
@@ -57,12 +82,20 @@ def _iso_z(dt: datetime) -> str:
 
 
 class Lake:
-    def __init__(self, data_dir: str | os.PathLike, compaction_delay_sec: float = 0.0):
+    def __init__(
+        self,
+        data_dir: str | os.PathLike,
+        compaction_delay_sec: float = 0.0,
+        withdrawals_enabled: bool = True,
+    ):
         self.data_dir = Path(data_dir)
         self.db_path = self.data_dir / "lake_meta.db"
         # Test/demo hook: pause after the input snapshot so callers can
         # observe uploads and reads happening *while* a compaction runs.
         self.compaction_delay_sec = compaction_delay_sec
+        # When False, new uploads are not tracked for withdrawal; batches
+        # already tracked keep being withdrawable.
+        self.withdrawals_enabled = withdrawals_enabled
         # Guards the inflight refcounts and serialises
         # (snapshot + acquire) against (retired-file reclamation).
         self._state_lock = threading.Lock()
@@ -87,13 +120,33 @@ class Lake:
         day_dir.mkdir(parents=True, exist_ok=True)
         final = day_dir / f"part-{uuid4().hex}.parquet"
         write_parquet_atomic(table, final)
+        now = _now_iso()
         try:
             with connect(str(self.db_path)) as conn:
-                conn.execute(
+                cur = conn.execute(
                     "INSERT INTO files(day, path, kind, state, rows, created_at)"
                     " VALUES (?, ?, 'upload', 'active', ?, ?)",
-                    (day, str(final), n, _now_iso()),
+                    (day, str(final), n, now),
                 )
+                tracked = False
+                if self.withdrawals_enabled:
+                    # The batch's full row multiset is persisted so it stays
+                    # withdrawable even after this parquet is compacted away
+                    # and its bytes are garbage collected.
+                    conn.execute(
+                        "INSERT INTO batches(day, file_name, file_path, rows, state, created_at)"
+                        " VALUES (?, ?, ?, ?, 'active', ?)",
+                        (day, final.name, str(final), n, now),
+                    )
+                    batch_id = conn.execute(
+                        "SELECT id FROM batches WHERE file_name = ?", (final.name,)
+                    ).fetchone()["id"]
+                    conn.executemany(
+                        "INSERT INTO batch_rows(batch_id, buoy_id, ts_us, salinity)"
+                        " VALUES (?, ?, ?, ?)",
+                        [(batch_id, b, ts, sal) for (b, ts, sal) in table_to_rows(table)],
+                    )
+                    tracked = True
         except Exception:
             final.unlink(missing_ok=True)  # never registered -> remove bytes
             raise
@@ -103,6 +156,7 @@ class Lake:
             "file": final.name,
             "rows": n,
             "file_count": self.file_count(day),
+            "withdrawable": tracked,
         }
 
     # ------------------------------------------------------------------
@@ -233,12 +287,28 @@ class Lake:
                 # Fully written + fsynced *before* the registry switch.
                 write_parquet_atomic(merged, output_path)
 
-            # Atomic switch: retire inputs, register output, mark job done.
+            # Atomic switch: retire inputs, register output, record lineage,
+            # mark job done.  Everything commits together (or nothing does).
             conn = connect(str(self.db_path))
             try:
                 conn.execute("BEGIN IMMEDIATE")
                 if input_paths:
                     placeholders = ",".join("?" for _ in input_paths)
+                    # A late compaction must never write back rows that were
+                    # withdrawn while it was merging: if any snapshot input is
+                    # no longer the active file it used to be, abort and fail
+                    # the job; all original data stays registered and readable.
+                    stale = conn.execute(
+                        f"SELECT COUNT(*) FROM files"
+                        f" WHERE path IN ({placeholders})"
+                        f"   AND NOT (day = ? AND state = 'active')",
+                        [*input_paths, day],
+                    ).fetchone()[0]
+                    if stale:
+                        raise WithdrawalConflictError(
+                            f"compaction job {job_id}: {stale} input file(s) changed"
+                            " (withdrawn) since the job started; refusing to switch"
+                        )
                     conn.execute(
                         f"UPDATE files SET state = 'retired'"
                         f" WHERE day = ? AND state = 'active' AND path IN ({placeholders})",
@@ -248,6 +318,11 @@ class Lake:
                         "INSERT INTO files(day, path, kind, state, rows, created_at)"
                         " VALUES (?, ?, 'compacted', 'active', ?, ?)",
                         (day, str(output_path), merged.num_rows, _now_iso()),
+                    )
+                    conn.executemany(
+                        "INSERT INTO file_lineage(src_path, dst_path, op)"
+                        " VALUES (?, ?, 'compaction')",
+                        [(p, str(output_path)) for p in input_paths],
                     )
                 conn.execute(
                     "UPDATE compactions SET status = 'done', output_path = ?,"
@@ -313,23 +388,314 @@ class Lake:
         return [self._job_dict(r) for r in rows]
 
     # ------------------------------------------------------------------
+    # withdrawals
+    # ------------------------------------------------------------------
+    def _resolve_active_file(self, start_path: str) -> str | None:
+        """Walk parquet provenance edges to the file currently carrying rows.
+
+        Returns the active registry path reached from ``start_path``, or
+        ``None`` if the chain ends at a retired file that has been garbage
+        collected (should not happen while a tracked batch is still active).
+        """
+        with connect(str(self.db_path)) as conn:
+            current = start_path
+            for _ in range(10_000):  # defensive: lineage chains are short
+                rows = conn.execute(
+                    "SELECT dst_path FROM file_lineage WHERE src_path = ? ORDER BY rowid",
+                    (current,),
+                ).fetchall()
+                if not rows:
+                    break
+                nxt = rows[-1]["dst_path"]
+                if nxt == "":
+                    # Terminal edge: a withdrawal removed the file's last rows,
+                    # so there is no successor parquet.
+                    return None
+                current = nxt
+            reg = conn.execute(
+                "SELECT state FROM files WHERE path = ?", (current,)
+            ).fetchone()
+        if reg is None or reg["state"] != "active":
+            return None
+        return current
+
+    def _batch_rows(self, conn: sqlite3.Connection, batch_id: int) -> list:
+        rows = conn.execute(
+            "SELECT buoy_id, ts_us, salinity FROM batch_rows WHERE batch_id = ?",
+            (batch_id,),
+        ).fetchall()
+        return [(r["buoy_id"], r["ts_us"], r["salinity"]) for r in rows]
+
+    def withdraw(self, day: str, file_name: str) -> dict:
+        """Withdraw the batch identified by its upload-response file name.
+
+        Multiset semantics: every row of the batch (including its internal
+        duplicates) is removed from whichever active parquet currently carries
+        it; identical values from other batches and unattributed legacy rows
+        stay.  Idempotent -- withdrawing an already withdrawn batch reports its
+        existing withdrawal instead of touching any data.
+        """
+        with connect(str(self.db_path)) as conn:
+            batch = conn.execute(
+                "SELECT * FROM batches WHERE day = ? AND file_name = ?",
+                (day, file_name),
+            ).fetchone()
+            if batch is None:
+                # Distinguish "unknown name" from "upload not tracked".
+                legacy = conn.execute(
+                    "SELECT 1 FROM files WHERE day = ? AND"
+                    " (path LIKE ? OR path = ?) LIMIT 1",
+                    (day, f"%/{file_name}", file_name),
+                ).fetchone()
+                if legacy is not None:
+                    raise WithdrawalNotAllowedError(
+                        f"file {file_name!r} was uploaded before withdrawals were"
+                        " enabled and cannot be withdrawn"
+                    )
+                raise NotFoundError(f"no tracked upload named {file_name!r} on day {day}")
+            batch_id = batch["id"]
+            if batch["state"] == "withdrawn":
+                wd = conn.execute(
+                    "SELECT * FROM withdrawals WHERE batch_id = ?", (batch_id,)
+                ).fetchone()
+                return self._withdrawal_dict(conn, wd, already=True)
+            batch_rows = self._batch_rows(conn, batch_id)
+
+        # Resolve the active file through compaction / rewrite provenance.
+        target_path = self._resolve_active_file(batch["file_path"])
+        if target_path is None:
+            raise NotFoundError(
+                f"current parquet for batch {file_name!r} is no longer registered"
+            )
+
+        # Compute the multiset difference BEFORE opening the switch
+        # transaction so the expensive parquet work never holds a write lock.
+        def _compute(path: str):
+            current = read_parquet_rows(path)
+            kept = multiset_difference(current, batch_rows)
+            if len(kept) == len(current):
+                # Invariant broken: none of the batch's rows are in its
+                # lineage file.  Refuse rather than silently no-op.
+                raise WithdrawalConflictError(
+                    f"batch {file_name!r} rows are not present in the current file"
+                )
+            return current, kept
+
+        day_dir = self._day_dir(day)
+        day_dir.mkdir(parents=True, exist_ok=True)
+        rewrite_name = f"rewrite-{batch_id}-{uuid4().hex[:8]}.parquet"
+        rewrite_path = day_dir / rewrite_name
+
+        def _materialize(path: str):
+            """Resolve, compute the difference, and stage the rewrite bytes.
+
+            Raises WithdrawalWriteError when the parquet write fails: the
+            registry has not been touched, so the original data and the
+            batch's active state are fully preserved and the call is retryable.
+            """
+            current, kept = _compute(path)
+            wrote = False
+            if kept:
+                try:
+                    write_parquet_atomic(rows_to_table(kept), rewrite_path)
+                    wrote = True
+                except Exception as exc:  # storage cleans its own tmp fragment
+                    raise WithdrawalWriteError(
+                        f"could not write withdrawal rewrite for {file_name!r}: {exc}"
+                    ) from exc
+            else:
+                rewrite_path.unlink(missing_ok=True)
+            return current, kept, wrote
+
+        current_rows, kept_rows, wrote_rewrite = _materialize(target_path)
+
+        last_exc: Exception | None = None
+        for attempt in range(3):
+            try:
+                return self._withdrawal_switch(
+                    day=day,
+                    batch_id=batch_id,
+                    file_name=file_name,
+                    target_path=target_path,
+                    expected_rows=len(current_rows),
+                    rewrite_path=rewrite_path,
+                    kept_rows=kept_rows,
+                    wrote_rewrite=wrote_rewrite,
+                )
+            except WithdrawalConflictError as exc:
+                # Another withdrawal/compaction changed the file under us:
+                # re-resolve and retry with a fresh multiset difference.
+                last_exc = exc
+                log.warning("withdrawal conflict for %s (attempt %d): %s",
+                            file_name, attempt + 1, exc)
+                target_path = self._resolve_active_file(batch["file_path"])
+                if target_path is None:
+                    raise NotFoundError(
+                        f"current parquet for batch {file_name!r} is no longer registered"
+                    ) from exc
+                current_rows, kept_rows, wrote_rewrite = _materialize(target_path)
+        raise WithdrawalConflictError(f"withdrawal of {file_name!r} kept conflicting: {last_exc}")
+
+    def _withdrawal_switch(
+        self,
+        day: str,
+        batch_id: int,
+        file_name: str,
+        target_path: str,
+        expected_rows: int,
+        rewrite_path: Path,
+        kept_rows: list,
+        wrote_rewrite: bool,
+    ) -> dict:
+        """Single-transaction registry switch for a withdrawal."""
+        now = _now_iso()
+        conn = connect(str(self.db_path))
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            target = conn.execute(
+                "SELECT id, rows, state FROM files WHERE path = ?", (target_path,)
+            ).fetchone()
+            # The file must still be the same active registry row we computed
+            # the difference against; otherwise a concurrent switch happened
+            # and the caller must retry against the new file.
+            if target is None or target["state"] != "active" or target["rows"] != expected_rows:
+                raise WithdrawalConflictError(
+                    f"target file {Path(target_path).name} changed during withdrawal"
+                )
+            if wrote_rewrite:
+                conn.execute(
+                    "INSERT INTO files(day, path, kind, state, rows, created_at)"
+                    " VALUES (?, ?, 'rewrite', 'active', ?, ?)",
+                    (day, str(rewrite_path), len(kept_rows), now),
+                )
+                conn.execute(
+                    "INSERT INTO file_lineage(src_path, dst_path, op)"
+                    " VALUES (?, ?, 'withdraw')",
+                    (target_path, str(rewrite_path)),
+                )
+            else:
+                # Every row of the file belonged to withdrawn batches: no
+                # successor parquet is needed; lineage simply ends here.
+                conn.execute(
+                    "INSERT INTO file_lineage(src_path, dst_path, op)"
+                    " VALUES (?, '', 'withdraw')",
+                    (target_path,),
+                )
+            conn.execute(
+                "UPDATE files SET state = 'retired' WHERE id = ?", (target["id"],)
+            )
+            cur = conn.execute(
+                "INSERT INTO withdrawals(day, batch_id, file_name, removed_rows, created_at)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (day, batch_id, file_name, expected_rows - len(kept_rows), now),
+            )
+            withdrawal_id = cur.lastrowid
+            conn.execute(
+                "UPDATE batches SET state = 'withdrawn', withdrawn_at = ? WHERE id = ?",
+                (now, batch_id),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+        log.info("withdrew batch %s: %d row(s) removed",
+                 file_name, expected_rows - len(kept_rows))
+        self.collect_garbage()
+        with connect(str(self.db_path)) as conn:
+            wd = conn.execute(
+                "SELECT * FROM withdrawals WHERE id = ?", (withdrawal_id,)
+            ).fetchone()
+            return self._withdrawal_dict(conn, wd, already=False)
+
+    @staticmethod
+    def _withdrawal_dict(conn: sqlite3.Connection, row: sqlite3.Row, already: bool) -> dict:
+        day_row_count = conn.execute(
+            "SELECT COALESCE(SUM(rows), 0) FROM files WHERE day = ? AND state = 'active'",
+            (row["day"],),
+        ).fetchone()[0]
+        file_count = conn.execute(
+            "SELECT COUNT(*) FROM files WHERE day = ? AND state = 'active'",
+            (row["day"],),
+        ).fetchone()[0]
+        return {
+            "withdrawal_id": row["id"],
+            "day": row["day"],
+            "file": row["file_name"],
+            "status": "already_withdrawn" if already else "withdrawn",
+            "removed_rows": row["removed_rows"],
+            "file_count": file_count,
+            "row_count": day_row_count,
+            "created_at": row["created_at"],
+        }
+
+    def list_withdrawals(self, day: str) -> dict:
+        with connect(str(self.db_path)) as conn:
+            rows = conn.execute(
+                "SELECT * FROM withdrawals WHERE day = ? ORDER BY id", (day,)
+            ).fetchall()
+            return {
+                "day": day,
+                "count": len(rows),
+                "withdrawals": [
+                    {
+                        "withdrawal_id": r["id"],
+                        "file": r["file_name"],
+                        "removed_rows": r["removed_rows"],
+                        "created_at": r["created_at"],
+                    }
+                    for r in rows
+                ],
+            }
+
+    def get_batch_status(self, day: str, file_name: str) -> dict:
+        with connect(str(self.db_path)) as conn:
+            batch = conn.execute(
+                "SELECT * FROM batches WHERE day = ? AND file_name = ?",
+                (day, file_name),
+            ).fetchone()
+            if batch is None:
+                raise NotFoundError(f"no tracked upload named {file_name!r} on day {day}")
+            wd = conn.execute(
+                "SELECT * FROM withdrawals WHERE batch_id = ?", (batch["id"],)
+            ).fetchone()
+            return {
+                "day": day,
+                "file": file_name,
+                "state": batch["state"],
+                "rows": batch["rows"],
+                "withdrawal": self._withdrawal_dict(conn, wd, already=True) if wd else None,
+            }
+
+    # ------------------------------------------------------------------
     # garbage collection of retired files
     # ------------------------------------------------------------------
     def collect_garbage(self) -> int:
         """Unlink retired files whose in-flight readers have all finished.
 
         Never touches ``active`` files, so freshly appended parquet files are
-        always safe.
+        always safe.  Retired files that belong to a still-running compaction
+        snapshot are also pinned: that worker may still be reading their bytes
+        when the merge started before the files were retired (e.g. a withdrawal
+        that interleaved with a late compaction).
         """
         collected = 0
         with self._state_lock:
             with connect(str(self.db_path)) as conn:
+                pinned: set[str] = set()
+                for job in conn.execute(
+                    "SELECT input_paths FROM compactions WHERE status = 'running'"
+                ).fetchall():
+                    pinned.update(json.loads(job["input_paths"]))
                 retired = conn.execute(
                     "SELECT id, path FROM files WHERE state = 'retired'"
                 ).fetchall()
                 for row in retired:
                     if self._inflight.get(row["path"], 0) > 0:
                         continue  # a reader is still using these bytes
+                    if row["path"] in pinned:
+                        continue  # a running compaction may still be merging them
                     try:
                         os.unlink(row["path"])
                     except FileNotFoundError:
@@ -338,6 +704,11 @@ class Lake:
                         log.exception("could not unlink retired file %s", row["path"])
                         continue  # keep the row, retry on the next sweep
                     conn.execute("DELETE FROM files WHERE id = ?", (row["id"],))
+                    # Lineage edges are intentionally retained after the
+                    # registry row of a retired file is gone: they are batch
+                    # provenance metadata and a tracked batch may still need
+                    # to walk through this hop long after the bytes were
+                    # reclaimed.
                     collected += 1
         if collected:
             log.info("collected %d retired file(s)", collected)
@@ -357,6 +728,8 @@ class Lake:
             for row in retired:
                 Path(row["path"]).unlink(missing_ok=True)
                 conn.execute("DELETE FROM files WHERE id = ?", (row["id"],))
+                # Lineage edges are kept: they are provenance metadata that
+                # tracked batches still need after the bytes are reclaimed.
                 stats["retired_removed"] += 1
             known = {r["path"] for r in conn.execute("SELECT path FROM files").fetchall()}
             running = conn.execute(
